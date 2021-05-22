@@ -35,7 +35,7 @@ END_LEGAL */
 #ifndef PIN_CACHE_H
 #define PIN_CACHE_H
 
-#define SET_OF_INTEREST 2
+#define SET_OF_INTEREST 35
 #define KILO 1024
 #define MEGA (KILO*KILO)
 #define GIGA (KILO*MEGA)
@@ -80,7 +80,7 @@ struct victim_buffer{
  bool valid;
  uint64_t timestamp;
 };
-#define NUM_VICTIM_ENTRIES 6 
+#define NUM_VICTIM_ENTRIES 240
 
 
 victim_buffer low_use_victim_entries[NUM_VICTIM_ENTRIES];
@@ -88,6 +88,8 @@ bool victim_buffer_entries_initialized = false;
 
 
 map<uint64_t, set<uint64_t>> low_use_block_address_and_burst_counts;
+
+map<uint64_t, set<uint64_t>> mapping_from_block_to_functions_used_block;
 
 struct burst_and_confidence{
    uint64_t burst_count;
@@ -169,7 +171,7 @@ uint32_t number_of_cache_sets;
 
 //bit is set if the cache set 
 //is gauged to be hot.
-bitset<128> hotness_of_sets;
+bitset<256> hotness_of_sets;
 //need to clear the bitset in the beginning. 
 bool bitset_cleared = false;
 
@@ -227,6 +229,8 @@ struct hit_and_use_information{
 	uint32_t total_low_use_misses;
 	uint32_t burst_count_of_missed_block;
 	bool icache_nmru_hit;
+	//block that was fetched as a result of spatial fetch and hit. 
+	bool spatial_fetch_hit;
 };
 
 /*!
@@ -410,7 +414,8 @@ class BURST_BASED_CACHE
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use,
 		    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block, 
+		    uint64_t current_function)
     {
         bool result = true;
 	total_accesses++;
@@ -478,7 +483,7 @@ class BURST_BASED_CACHE
 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use, 
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped,
-		    bool straggler_remove, uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    bool straggler_remove, uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         // g++ -O3 too dumb to do CSE on following lines?!
       //  const UINT32 index = _nextReplaceIndex;
@@ -656,7 +661,8 @@ class BURST_BASED_CACHE_CONFIDENCE
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use,
 		    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block,
+		    uint64_t current_function)
     {
         bool result = true;
 	total_accesses++;
@@ -724,7 +730,7 @@ class BURST_BASED_CACHE_CONFIDENCE
 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use, 
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped, bool straggler_remove,
-		    uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         //initialize an entry in the table for this cache block
 	//if one does not exist already.
@@ -910,7 +916,8 @@ class ROUND_ROBIN_PLUS_DIRECT_MAPPED
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use,
 		    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block,
+		    uint64_t current_function)
     {
         bool result = true;
 	total_accesses++;
@@ -964,7 +971,7 @@ class ROUND_ROBIN_PLUS_DIRECT_MAPPED
 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use, 
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped, bool straggler_remove,
-		    uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         // g++ -O3 too dumb to do CSE on following lines?!
       //  const UINT32 index = _nextReplaceIndex;
@@ -1043,6 +1050,8 @@ class ROUND_ROBIN
     //store the address of the item also alongside, so we can retrieve it on a replacement. 
     uint64_t _addr[MAX_ASSOCIATIVITY];
     
+    bool _spatial_fetched_block[MAX_ASSOCIATIVITY];
+    
     UINT32 _tagsLastIndex;
     UINT32 _nextReplaceIndex;
 
@@ -1063,6 +1072,7 @@ class ROUND_ROBIN
 	 _addr[index] = 0;
          //want to note the burst count for all live cache blocks	
 	 _burst_count_for_cache_blocks_when_live[index] = 0;
+	 _spatial_fetched_block[index] = 0;
 	 _function[index] = 0;
 	}
 	_mru_position = 0;
@@ -1102,7 +1112,8 @@ class ROUND_ROBIN
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use,
 		    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block,
+		    uint64_t current_function)
     {
         bool result = true;
 	total_accesses++;
@@ -1112,36 +1123,50 @@ class ROUND_ROBIN
             // this is an ugly micro-optimization, but it does cause a
             // tighter assembly loop for ARM that way ...
             if(_tags[index] == tag) {
+		    //if the block was spatially fetched, then set the bool
+		    //and reset this field as reference in original cache would've 
+		    //anyways bought this into the cache
+		    //uint64_t blk_addr_for_this_block = _addr[index];
+
+		    if (_spatial_fetched_block[index] == 1){
+			   is_spatial_fetched_block = true; 
+			   _spatial_fetched_block[index] = 0;
+		    }
+		   // if (mapping_from_block_to_functions_used_block[blk_addr_for_this_block].find(current_function) 
+		   //     	    == mapping_from_block_to_functions_used_block[blk_addr_for_this_block].end()){
+		   //         is_spatial_fetched_block = true;
+		   //         mapping_from_block_to_functions_used_block[blk_addr_for_this_block].insert(current_function);
+		   // }
 		    if (index != _mru_position){
 			    non_mru_hit = true;
 		    	    _burst_count_for_cache_blocks_when_live[_mru_position]++; 
 		    	    
-			    vector<uint64_t> low_use_blocks; 
+			vector<uint64_t> low_use_blocks; 
 			uint32_t number_of_looping_blocks = 0;
 			for (INT32 index = _tagsLastIndex; index >= 0; index--)
 		        {
 			      uint64_t block_address_for_block_at_index;
-			      block_address_for_block_at_index = _function[index];
+			      block_address_for_block_at_index = _addr[index];
 		               
 			      if(mapping_from_cache_block_to_mostly_miss[block_address_for_block_at_index]){
 		              	 low_use_blocks.push_back(block_address_for_block_at_index);
 				 number_of_looping_blocks++;
 			      }
 		        }
-	        	if ((number_of_looping_blocks <= 2)&&
+	        	if ((number_of_looping_blocks >= 4)&&
 	        			(number_of_looping_blocks>0)){
-	        	    for (uint32_t i = 0;i<number_of_looping_blocks;i++)
-	        	            cout << low_use_blocks.at(i) <<"," ;
-	        	    cout << endl;
-	        	    cout <<"The current set is a hot set " << setIndex <<" and the number of looping blocks are " << 
-	        	           number_of_looping_blocks << endl;	
-	        	    cout << "The set of interest is " << setIndex << endl;
+	        	   // for (uint32_t i = 0;i<number_of_looping_blocks;i++)
+	        	   //         cout << low_use_blocks.at(i) <<"," ;
+	        	   // cout << endl;
+	        	   // cout <<"The current set is a hot set " << setIndex <<" and the number of looping blocks are " << 
+	        	   //        number_of_looping_blocks << endl;	
+	        	   // cout << "The set of interest is " << setIndex << endl;
 	        	    hotness_of_sets.set(setIndex);
-	        	    cout << "Number of hot sets in the cache are " << hotness_of_sets.count() << endl;
+	        	   // cout << "Number of hot sets in the cache are " << hotness_of_sets.count() << endl;
 	        	}
 	        	else{
-	   		    if (hotness_of_sets.test(setIndex)) 
-			    	cout << "Unsetting: set of interest is " << setIndex << endl;
+	   		   // if (hotness_of_sets.test(setIndex)) 
+			   // 	cout << "Unsetting: set of interest is " << setIndex << endl;
 			    hotness_of_sets.reset(setIndex);
 			}    
 			    uint64_t blk_address_exp_nmru_hit = _addr[index];
@@ -1198,7 +1223,7 @@ class ROUND_ROBIN
 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use, 
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped, bool straggler_remove,
-		    uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         // g++ -O3 too dumb to do CSE on following lines?!
       //  const UINT32 index = _nextReplaceIndex;
@@ -1219,27 +1244,27 @@ class ROUND_ROBIN
 	for (INT32 index = _tagsLastIndex; index >= 0; index--)
         {
 	      uint64_t block_address_for_block_at_index;
-	      block_address_for_block_at_index = _function[index];
+	      block_address_for_block_at_index = _addr[index];
                
 	      if(mapping_from_cache_block_to_mostly_miss[block_address_for_block_at_index]){
               	 low_use_blocks.push_back(block_address_for_block_at_index);
 		 number_of_looping_blocks++;
 	      }
         }
-	if ((number_of_looping_blocks <= 2)&&
+	if ((number_of_looping_blocks >= 4)&&
 			(number_of_looping_blocks>0)){
-	    for (uint32_t i = 0;i<number_of_looping_blocks;i++)
-	            cout << low_use_blocks.at(i) <<"," ;
-	    cout << endl;
-	    cout <<"The current set is a hot set " << setIndex <<" and the number of looping blocks are " << 
-	           number_of_looping_blocks << endl;	
-	    cout << "The set of interest is " << setIndex << endl;
+	  //  for (uint32_t i = 0;i<number_of_looping_blocks;i++)
+	  //          cout << low_use_blocks.at(i) <<"," ;
+	  //  cout << endl;
+	  //  cout <<"The current set is a hot set " << setIndex <<" and the number of looping blocks are " << 
+	  //         number_of_looping_blocks << endl;	
+	  //  cout << "The set of interest is " << setIndex << endl;
 	    hotness_of_sets.set(setIndex);
-	    cout << "Number of hot sets in the cache are " << hotness_of_sets.count() << endl;
+	  //  cout << "Number of hot sets in the cache are " << hotness_of_sets.count() << endl;
 	}
 	else{
-	   if (hotness_of_sets.test(setIndex)) 
- 	   	cout << "Unsetting: set of interest is " << setIndex << endl;
+	  // if (hotness_of_sets.test(setIndex)) 
+ 	  // 	cout << "Unsetting: set of interest is " << setIndex << endl;
 	   hotness_of_sets.reset(setIndex);
 	}
         
@@ -1272,6 +1297,14 @@ class ROUND_ROBIN
 	_mru_position = index;
 	_degree_of_use[index] = degree_of_use;
 	_addr[index] = blk_addr;
+	//keep track of which function brought this block into the cache. 
+//	mapping_from_block_to_functions_used_block[blk_addr].clear();
+//	mapping_from_block_to_functions_used_block[blk_addr].insert(current_function);
+	
+	if (spatial_fetch)
+		_spatial_fetched_block[index] = true;
+	else
+		_spatial_fetched_block[index] = false;
 	//block experiencing miss for the first time. 
 	if (mapping_from_cache_block_to_misses_and_nmru_hits_ratio.find(blk_addr) ==
 			mapping_from_cache_block_to_misses_and_nmru_hits_ratio.end()){
@@ -1390,7 +1423,8 @@ class ROUND_ROBIN_PLUS_SELECTIVE_VICTIM
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use,
 		    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block,
+		    uint64_t current_function)
     {
         bool result = true;
 	total_accesses++;
@@ -1407,7 +1441,49 @@ class ROUND_ROBIN_PLUS_SELECTIVE_VICTIM
             if(_tags[index] == tag) {
 		    if (index != _mru_position){
 			    non_mru_hit = true;
-		    	    _burst_count_for_cache_blocks_when_live[_mru_position]++; 
+		    	    _burst_count_for_cache_blocks_when_live[_mru_position]++;
+
+			vector<uint64_t> low_use_blocks; 
+			uint32_t number_of_looping_blocks = 0;
+			for (INT32 index = _tagsLastIndex; index >= 0; index--)
+		        {
+			      uint64_t block_address_for_block_at_index;
+			      block_address_for_block_at_index = _addr[index];
+		               
+			      if(mapping_from_cache_block_to_mostly_miss[block_address_for_block_at_index]){
+		              	 low_use_blocks.push_back(block_address_for_block_at_index);
+				 number_of_looping_blocks++;
+			      }
+		        }
+	        	if ((number_of_looping_blocks >= 4)&&
+	        			(number_of_looping_blocks>0)){
+	        	   // for (uint32_t i = 0;i<number_of_looping_blocks;i++)
+	        	   //         cout << low_use_blocks.at(i) <<"," ;
+	        	   // cout << endl;
+	        	   // cout <<"The current set is a hot set " << setIndex <<" and the number of looping blocks are " << 
+	        	   //        number_of_looping_blocks << endl;	
+	        	   // cout << "The set of interest is " << setIndex << endl;
+	        	    hotness_of_sets.set(setIndex);
+	        	   // cout << "Number of hot sets in the cache are " << hotness_of_sets.count() << endl;
+	        	}
+	        	else{
+	   		   // if (hotness_of_sets.test(setIndex)) 
+			   // 	cout << "Unsetting: set of interest is " << setIndex << endl;
+			    hotness_of_sets.reset(setIndex);
+			}   
+			   uint64_t blk_address_exp_nmru_hit = _addr[index];
+			   mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_address_exp_nmru_hit].hits++;
+		          //update bit and stats on NMRU hits as well. 
+			  if (mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_address_exp_nmru_hit].hits 
+			       	== 10){
+			       float miss_ratio = (float)mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_address_exp_nmru_hit].misses/(mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_address_exp_nmru_hit].hits + mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_address_exp_nmru_hit].misses);
+			  if (miss_ratio >= 0.5)
+			       mapping_from_cache_block_to_mostly_miss[blk_address_exp_nmru_hit] = true;
+			  else
+			       mapping_from_cache_block_to_mostly_miss[blk_address_exp_nmru_hit] = false;
+			  mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_address_exp_nmru_hit].misses = 0;
+			  mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_address_exp_nmru_hit].hits = 0;
+		        }
 		    }
 		    _tag_last_reference_time[index] = total_accesses;
 		    //update the mru index
@@ -1497,7 +1573,7 @@ class ROUND_ROBIN_PLUS_SELECTIVE_VICTIM
 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use, 
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped, bool straggler_remove,
-		    uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         // g++ -O3 too dumb to do CSE on following lines?!
       //  const UINT32 index = _nextReplaceIndex;
@@ -1509,7 +1585,43 @@ class ROUND_ROBIN_PLUS_SELECTIVE_VICTIM
 	_burst_count_for_cache_blocks_when_live[_mru_position]++;
         uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
         uint64_t _nextReplaceIndex = _tagsLastIndex;
-        //way 0 is for low use functions and all other ways are for high use functions. 
+        
+	
+	//check if looping pattern exists for the set and print if it doesn. 
+	//if more than 4 blocks have the low use bit set, then print.
+	uint32_t number_of_looping_blocks = 0;
+
+	vector<uint64_t> low_use_blocks; 
+	for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+	      uint64_t block_address_for_block_at_index;
+	      block_address_for_block_at_index = _addr[index];
+               
+	      if(mapping_from_cache_block_to_mostly_miss[block_address_for_block_at_index]){
+              	 low_use_blocks.push_back(block_address_for_block_at_index);
+		 number_of_looping_blocks++;
+	      }
+        }
+	if ((number_of_looping_blocks >= 4)&&
+			(number_of_looping_blocks>0)){
+	  //  for (uint32_t i = 0;i<number_of_looping_blocks;i++)
+	  //          cout << low_use_blocks.at(i) <<"," ;
+	  //  cout << endl;
+	  //  cout <<"The current set is a hot set " << setIndex <<" and the number of looping blocks are " << 
+	  //         number_of_looping_blocks << endl;	
+	  //  cout << "The set of interest is " << setIndex << endl;
+	    hotness_of_sets.set(setIndex);
+	  //  cout << "Number of hot sets in the cache are " << hotness_of_sets.count() << endl;
+	}
+	else{
+	  // if (hotness_of_sets.test(setIndex)) 
+ 	  // 	cout << "Unsetting: set of interest is " << setIndex << endl;
+	   hotness_of_sets.reset(setIndex);
+	}
+        
+	low_use_blocks.clear();	
+	
+	//way 0 is for low use functions and all other ways are for high use functions. 
 	//see how this fares.
 	for (INT32 index = _tagsLastIndex; index >= 0; index--)
         {
@@ -1532,7 +1644,8 @@ class ROUND_ROBIN_PLUS_SELECTIVE_VICTIM
         //then find a spot to place in the victim buffer and 
         //place this block there. 
         if (victim_search){
-              uint64_t block_address = temp.blk_addr;
+//              cout << "Placing entry in the victim cache " << endl;
+	      uint64_t block_address = temp.blk_addr;
               uint64_t min_access_time = low_use_victim_entries[NUM_VICTIM_ENTRIES-1].timestamp;
               uint64_t _nextReplaceIndex = (NUM_VICTIM_ENTRIES-1);
               for (INT32 index = (NUM_VICTIM_ENTRIES-1);
@@ -1560,6 +1673,28 @@ class ROUND_ROBIN_PLUS_SELECTIVE_VICTIM
 	_mru_position = index;
 	_degree_of_use[index] = degree_of_use;
 	_addr[index] = blk_addr;
+	
+	//block experiencing miss for the first time. 
+	if (mapping_from_cache_block_to_misses_and_nmru_hits_ratio.find(blk_addr) ==
+			mapping_from_cache_block_to_misses_and_nmru_hits_ratio.end()){
+		mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].misses = 1;
+		mapping_from_cache_block_to_mostly_miss[blk_addr] = false;
+	}
+	else{
+		mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].misses++;
+		if (mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].misses 
+				== 10){
+			float miss_ratio = (float)mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].misses/(mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].hits + mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].misses);
+			if (miss_ratio >= 0.5)
+				mapping_from_cache_block_to_mostly_miss[blk_addr] = true;
+			else
+				mapping_from_cache_block_to_mostly_miss[blk_addr] = false;
+			mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].misses = 0;
+			mapping_from_cache_block_to_misses_and_nmru_hits_ratio[blk_addr].hits = 0;
+		}
+
+	}
+	
 	_function[index] = current_function;
 	return temp;
     }
@@ -1640,7 +1775,8 @@ class CACHE_BELADY_OPT
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use,
 		    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block,
+		    uint64_t current_function)
     {
         bool result = true;
 	total_accesses++;
@@ -1693,7 +1829,7 @@ class CACHE_BELADY_OPT
 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use,
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped, bool straggler_remove,
-		    uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         uint64_t max_future_reference_timestamp = _tag_last_reference_time[_tagsLastIndex];
         uint64_t _nextReplaceIndex = _tagsLastIndex;
@@ -1809,7 +1945,8 @@ class MODIFIED_CACHE
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use, 
         	    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block,
+		    uint64_t current_function)
     {
         bool result = true;
         total_accesses++;
@@ -1904,7 +2041,7 @@ class MODIFIED_CACHE
 //function to place the medium degree of use cache block at LRU position-1. 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use,
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped, bool straggler_remove,
-		    uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
         uint64_t _nextReplaceIndex = _tagsLastIndex;
@@ -1951,7 +2088,7 @@ class MODIFIED_CACHE
 //function to place the medium degree of use cache block at LRU position-1. 
     use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use, uint64_t future_reference_timestamp, 
 		    float block_degree_of_use, bool direct_mapped, bool straggler_remove,
-		    uint64_t current_function, bool victim_search, uint32_t setIndex)
+		    uint64_t current_function, bool victim_search, uint32_t setIndex, bool spatial_fetch)
     {
         uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
         uint64_t _nextReplaceIndex = _tagsLastIndex;
@@ -2009,7 +2146,7 @@ class MODIFIED_CACHE
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped,
 		    bool straggler_remove,
 		    uint64_t current_function, bool victim_search, 
-		    uint32_t setIndex)
+		    uint32_t setIndex, bool spatial_fetch)
     {
         uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
         uint64_t _nextReplaceIndex = _tagsLastIndex;
@@ -2072,7 +2209,7 @@ class MODIFIED_CACHE
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped,
 		    bool straggler_remove,
 		    uint64_t current_function, bool victim_search,
-		    uint32_t setIndex)
+		    uint32_t setIndex, bool spatial_fetch)
     {
         uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
         uint64_t _nextReplaceIndex = _tagsLastIndex;
@@ -2140,7 +2277,7 @@ class MODIFIED_CACHE
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped,
 		    bool straggler_remove,
 		    uint64_t current_function, bool victim_search,
-		    uint32_t setIndex)
+		    uint32_t setIndex, bool spatial_fetch)
     {
         uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
         uint64_t _nextReplaceIndex = _tagsLastIndex;
@@ -2276,7 +2413,8 @@ class MODIFIED_CACHE_2
     // high degree of use. 
     UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use, 
 		    bool &non_mru_hit, uint64_t future_reference_timestamp,
-		    bool victim_search, uint32_t setIndex)
+		    bool victim_search, uint32_t setIndex, bool &is_spatial_fetched_block,
+		    uint64_t current_function)
     {
         bool result = true;
 	total_accesses++;
@@ -2326,7 +2464,7 @@ class MODIFIED_CACHE_2
 		    uint64_t future_reference_timestamp, float block_degree_of_use, bool direct_mapped,
 		    bool straggler_remove,
 		    uint64_t current_function, bool victim_search,
-		    uint32_t setIndex)
+		    uint32_t setIndex, bool spatial_fetch)
     {
         // g++ -O3 too dumb to do CSE on following lines?!
       //  const UINT32 index = _nextReplaceIndex;
@@ -2580,22 +2718,6 @@ string CACHE_BASE::StatsLong(string prefix, CACHE_TYPE cache_type) const
     }
     out += "\n";
     std::stringstream ss_1;
-    cout << "Size of the list is " <<accesses_to_set_56.size() << endl;
-//    cout << "Unique blocks inserted in set 56: "<< unique_accesses_to_set_56.size() << endl;
-//    ss_1 << "Unique blocks inserted in set 56: "<< unique_accesses_to_set_56.size() << endl;
-//    for (uint64_t i = 0;i<accesses_to_set_56.size();i++){
-//	string hit_miss_degree_of_use;
-//	if (hit_miss_accesses_to_set_56.at(i))
-//		hit_miss_degree_of_use += "H";
-//	else
-//		hit_miss_degree_of_use += "M";
-//	if (degree_of_use_block.at(i))
-//		hit_miss_degree_of_use += ",H,";
-//	else
-//		hit_miss_degree_of_use += ",L,";
-	 //ss_1 <<accesses_to_set_56.at(i) <<"(" + hit_miss_degree_of_use << block_degree_of_use_block.at(i) << "),";
-//	 ss_1 <<accesses_to_set_56.at(i) << ",";
-//    }
 
     ss_1 << "Misses for different cache blocks in the set" << endl;
     for(std::map<uint64_t,uint64_t>::iterator iter = mapping_from_cache_block_to_miss_counts.begin(); 
@@ -2606,19 +2728,15 @@ string CACHE_BASE::StatsLong(string prefix, CACHE_TYPE cache_type) const
 		mapping_from_cache_block_to_access_nmru_plus_miss_counts[iter->first] << endl;
 	ss_1 << "Accesses (total) for " << iter->first <<": " << 
 		mapping_from_cache_block_to_total_access_counts[iter->first] << endl;
-	if (mapping_from_cache_block_to_degree_of_use[iter->first])
-		ss_1 <<"Block finally characterized as being high use" << endl;
-	else
-		ss_1 <<"Block finally characterized as being low use" << endl;
-	ss_1 <<"Functions corresponding to cache blocks " << endl << "(";
-	for (std::set<uint64_t>::iterator iter1 = mapping_from_cache_block_to_corresponding_function[iter->first].begin();
-			iter1 != mapping_from_cache_block_to_corresponding_function[iter->first].end();
-			++iter1){
-		ss_1 << *(iter1) << ",";
-	}
+//	ss_1 <<"Functions corresponding to cache blocks " << endl << "(";
+//	for (std::set<uint64_t>::iterator iter1 = mapping_from_cache_block_to_corresponding_function[iter->first].begin();
+//			iter1 != mapping_from_cache_block_to_corresponding_function[iter->first].end();
+//			++iter1){
+//		ss_1 << *(iter1) << ",";
+//	}
 	ss_1 << endl;
     }
-//
+
 
 
 //uncomment start here
@@ -2635,25 +2753,26 @@ string CACHE_BASE::StatsLong(string prefix, CACHE_TYPE cache_type) const
 	ss_1 << "Function invocation counts (total) for " << iter->first <<": " << 
 		mapping_from_function_to_total_invocation_count[iter->first] << endl;
 	
-	uint64_t total_intermediate_function_accesses =	mapping_from_function_to_invocation_statistics[iter->first].intermediate_function_invocations;
-	uint64_t total_function_invocations = mapping_from_function_to_invocation_statistics[iter->first].total_function_invocations;
-	float average_reuse_distance = (float)total_intermediate_function_accesses/total_function_invocations;
-	ss_1 << "Average reuse distance of the function is " << average_reuse_distance << endl; 
-	ss_1 << "Temporal average reuse distances across periodic 1000 function invocations is " << endl << "(";
-	for (vector<float>::iterator iter1 = mapping_from_function_to_reuse_distances_over_1000_function_invocations[iter->first].begin();
-                    iter1 != mapping_from_function_to_reuse_distances_over_1000_function_invocations[iter->first].end(); ++iter1){
-       		ss_1 << *(iter1) << ",";
-	}
-	ss_1 << ")" << endl;
+//	uint64_t total_intermediate_function_accesses =	mapping_from_function_to_invocation_statistics[iter->first].intermediate_function_invocations;
+//	uint64_t total_function_invocations = mapping_from_function_to_invocation_statistics[iter->first].total_function_invocations;
+//	float average_reuse_distance = (float)total_intermediate_function_accesses/total_function_invocations;
+//	ss_1 << "Average reuse distance of the function is " << average_reuse_distance << endl; 
+//	ss_1 << "Temporal average reuse distances across periodic 1000 function invocations is " << endl << "(";
+//	for (vector<float>::iterator iter1 = mapping_from_function_to_reuse_distances_over_1000_function_invocations[iter->first].begin();
+//                    iter1 != mapping_from_function_to_reuse_distances_over_1000_function_invocations[iter->first].end(); ++iter1){
+//       		ss_1 << *(iter1) << ",";
+//	}
+//	ss_1 << ")" << endl;
+//
+//	ss_1 <<"Previous accessed function (which was an NMRU hit or a miss) before the current function (most of the time): " << endl;
+//        for(std::map<uint64_t,uint64_t>::iterator iter1 = mapping_from_function_to_functions_evicted_to_make_room[iter->first].begin(); 
+//		    iter1 != mapping_from_function_to_functions_evicted_to_make_room[iter->first].end(); ++iter1){
+//		    uint64_t total_evictions_caused_by_function_of_interest = mapping_from_function_to_functions_evicted_to_make_room[iter->first][iter1->first];
+//	//print if the function accounts for atleast 1000 of the eviction of this function
+//        if(total_evictions_caused_by_function_of_interest>=500)	
+//		ss_1 << "("<<iter1->first <<","<<mapping_from_function_to_functions_evicted_to_make_room[iter->first][iter1->first] <<"),";
+//	}
 
-	ss_1 <<"Previous accessed function (which was an NMRU hit or a miss) before the current function (most of the time): " << endl;
-        for(std::map<uint64_t,uint64_t>::iterator iter1 = mapping_from_function_to_functions_evicted_to_make_room[iter->first].begin(); 
-		    iter1 != mapping_from_function_to_functions_evicted_to_make_room[iter->first].end(); ++iter1){
-		    uint64_t total_evictions_caused_by_function_of_interest = mapping_from_function_to_functions_evicted_to_make_room[iter->first][iter1->first];
-	//print if the function accounts for atleast 1000 of the eviction of this function
-        if(total_evictions_caused_by_function_of_interest>=500)	
-		ss_1 << "("<<iter1->first <<","<<mapping_from_function_to_functions_evicted_to_make_room[iter->first][iter1->first] <<"),";
-	}
 	ss_1 << endl;
 
     }
@@ -2697,12 +2816,12 @@ class CACHE : public CACHE_BASE
     bool Access(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType);
     //smurthy
     //selectively allocate a line based on a allocate condition
-    hit_and_use_information Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool allocate, bool degree_of_use,bool medium_degree_of_use, bool special_cache_type, uint64_t future_reference_timestamp, bool warmup_finished, float block_degree_of_use,uint64_t current_function, uint64_t current_function_invocation);
+    hit_and_use_information Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool allocate, bool degree_of_use,bool medium_degree_of_use, bool special_cache_type, uint64_t future_reference_timestamp, bool warmup_finished, float block_degree_of_use,uint64_t current_function, uint64_t current_function_invocation, bool spatial_fetch);
     /// Cache access at addr that does not span cache lines
     bool AccessSingleLine(ADDRINT addr, ACCESS_TYPE accessType);
     //smurthy
     //selectively allocate a line based on a allocate condition
-    hit_and_use_information AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool allocate, bool degree_of_use, bool medium_degree_of_use, bool special_cache_type, uint64_t future_reference_timestamp, bool warmup_finished, float block_degree_of_use, uint64_t current_function, uint64_t current_function_invocation);
+    hit_and_use_information AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool allocate, bool degree_of_use, bool medium_degree_of_use, bool special_cache_type, uint64_t future_reference_timestamp, bool warmup_finished, float block_degree_of_use, uint64_t current_function, uint64_t current_function_invocation, bool spatial_fetch);
 };
 
 /*!
@@ -2748,13 +2867,15 @@ bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access(ADDRINT addr, UINT32 size, ACC
 
 
 template <class SET, UINT32 MAX_SETS, UINT32 STORE_ALLOCATION>
-hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool selective_allocate, bool degree_of_use, bool medium_degree_of_use,  bool special_cache_type, uint64_t future_reference_timestamp, bool _warmup_finished, float block_degree_of_use, uint64_t current_function, uint64_t current_function_invocation_count)
+hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool selective_allocate, bool degree_of_use, bool medium_degree_of_use,  bool special_cache_type, uint64_t future_reference_timestamp, bool _warmup_finished, float block_degree_of_use, uint64_t current_function, uint64_t current_function_invocation_count, bool spatial_fetch)
 {
     const ADDRINT highAddr = addr + size;
     bool allHit = true;
 
     //non-mru-hit
     bool all_non_mru_hit = false;
+    //all-spatial-fetch-hit
+    bool all_spatial_fetch_hit = false;
 
     //clear the bitset if not done already. 
     if (!bitset_cleared){
@@ -2768,6 +2889,7 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
     temp.icache_hit = false;
     temp.function_use_information = false;
     temp.icache_nmru_hit = false;
+
     use_and_blk_addr temp1;
     do
     {
@@ -2790,12 +2912,13 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
 	
         SET &set = _sets[setIndex];
 	bool non_mru_hit = false;
-        
+        bool spatial_fetch_hit = false; 
         bool victim_search = false;
-//	if (setIndex == SET_OF_INTEREST)
+	//if (setIndex == SET_OF_INTEREST)
 		victim_search = true;
 	bool localHit = set.Find_UpdateDegreeOfUse(addr, tag, degree_of_use, medium_degree_of_use,
-			non_mru_hit, future_reference_timestamp, victim_search, setIndex);
+			non_mru_hit, future_reference_timestamp, victim_search, setIndex,
+			spatial_fetch_hit, current_function);
 	if (setIndex == SET_OF_INTEREST){
 		if (mapping_from_function_to_current_invocation_count.find(current_function) == mapping_from_function_to_current_invocation_count.end()){
 			mapping_from_function_to_current_invocation_count[current_function] = 0;
@@ -2809,22 +2932,10 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
 			mapping_from_function_to_current_invocation_count[current_function] = current_function_invocation_count;
 			//add the current function to the map of all other functions in the data structure, to correct tap the reuse distance. 
 
-    			for(std::map<uint64_t,function_invocation_details>::iterator iter = mapping_from_function_to_invocation_statistics.begin(); 
-		    			iter != mapping_from_function_to_invocation_statistics.end(); ++iter)
-    			{
-				if (iter->first != current_function){
-					mapping_from_function_to_other_functions_accessed_till_next_invocation[iter->first].insert(current_function);	
-		      		}
-			}
-			if (!localHit){
+			//ignore the misses coming due to spatial fetch of a function
+			if (!localHit && (!spatial_fetch)){
 				mapping_from_function_to_invocation_statistics[current_function].intermediate_function_invocations += mapping_from_function_to_other_functions_accessed_till_next_invocation[current_function].size();
 				mapping_from_function_to_invocation_statistics[current_function].total_function_invocations += 1;
-			}
-			if (mapping_from_function_to_invocation_statistics[current_function].total_function_invocations 
-					== 1000){
-				mapping_from_function_to_reuse_distances_over_1000_function_invocations[current_function].push_back((float)mapping_from_function_to_invocation_statistics[current_function].intermediate_function_invocations/mapping_from_function_to_invocation_statistics[current_function].total_function_invocations);
-				mapping_from_function_to_invocation_statistics[current_function].intermediate_function_invocations = 0;
-				mapping_from_function_to_invocation_statistics[current_function].total_function_invocations = 0;
 			}
 			mapping_from_function_to_other_functions_accessed_till_next_invocation[current_function].clear();	
 		}
@@ -2834,7 +2945,7 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
 	      //as references.
 	       if (non_mru_hit || (!localHit)){
 		   array_of_nmru_plus_miss_references_per_set[setIndex]++;
-		   if ((setIndex == SET_OF_INTEREST)){
+		 //  if ((setIndex == SET_OF_INTEREST)){
 			   //note the invocation of the function. 
 		           uint64_t blk_addr = addr&notLineMask;
 			   mapping_from_cache_block_to_corresponding_function[blk_addr].insert(current_function);
@@ -2865,24 +2976,17 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
 					   mapping_from_function_to_total_access_counts.end()){
 			   	mapping_from_function_to_total_access_counts[current_function] = 0;
 			   }
-			   if (non_mru_hit)
-			   	hit_miss_accesses_to_set_56.push_back(true);
-			   else
-			   	hit_miss_accesses_to_set_56.push_back(false);
-			   if (degree_of_use)
-				degree_of_use_block.push_back(true);
-			   else
-				degree_of_use_block.push_back(false);
 			   mapping_from_cache_block_to_degree_of_use[blk_addr] = degree_of_use;
-			   if (!localHit){
+			   //ignore the misses coming due to spatial fetch of a function
+			   if (!localHit && (!spatial_fetch)){
 				   mapping_from_cache_block_to_miss_counts[blk_addr]++;
 			   	   mapping_from_function_to_miss_counts[current_function]++;
 			   }
 			   mapping_from_cache_block_to_access_nmru_plus_miss_counts[blk_addr]++;
 		  	   mapping_from_function_to_access_nmru_plus_miss_counts[current_function]++;
 			   
-			   block_degree_of_use_block.push_back(block_degree_of_use); 
-		   }
+			  // block_degree_of_use_block.push_back(block_degree_of_use); 
+		   //}
 		   counter_of_references_per_set[setIndex]++;
 	       }
 	}
@@ -2894,18 +2998,10 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
 		mapping_from_function_to_total_access_counts[current_function]++;
 	}
 	
-      //  if (setIndex == SET_OF_INTEREST){
-      //      if (!localHit){
-      //          cout <<"Miss on function: " << current_function << " and cache block address is: " <<
-      //  	       blk_addr	<< endl;	
-      //      }
-      //      else if (non_mru_hit){
-      //         cout <<"NMRU hit on function: " << current_function << " and cache block address is: " <<
-      //  	      blk_addr << endl;	
-      //      }
-      //  }
 	current_cache_block_in_use = addr&notLineMask;
-	if (!localHit){
+
+	//ignore the misses coming due to spatial fetch of a function
+	if (!localHit && (!spatial_fetch)){
 		counter_of_misses_per_set[setIndex]++;
 		array_of_misses_per_set[setIndex]++;
 	}
@@ -2922,26 +3018,17 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
 	//direct_mapped_bit = false;
 	allHit &= localHit;
 	all_non_mru_hit |= non_mru_hit;
+	all_spatial_fetch_hit |= spatial_fetch_hit;
         // on miss, loads always allocate, stores optionally
         
-	if ((setIndex == SET_OF_INTEREST) && (non_mru_hit || !localHit)){
-		if (mapping_from_function_to_functions_evicted_to_make_room[current_function].find(previous_accessed_function) 
-				== mapping_from_function_to_functions_evicted_to_make_room[current_function].end())
-			mapping_from_function_to_functions_evicted_to_make_room[current_function][previous_accessed_function] = 0;
-		else
-			mapping_from_function_to_functions_evicted_to_make_room[current_function][previous_accessed_function]++;
-		previous_accessed_function = current_function;
-	}  
 	
 	if ((selective_allocate) && (!localHit) && (accessType == ACCESS_TYPE_LOAD || STORE_ALLOCATION == CACHE_ALLOC::STORE_ALLOCATE))
         {
 	     temp1 = set.Replace_GetDegreeOfUse(tag, degree_of_use,addr&notLineMask, medium_degree_of_use, 
 			   future_reference_timestamp, block_degree_of_use, direct_mapped_bit, false, current_function,
-			   victim_search, setIndex);
+			   victim_search, setIndex, spatial_fetch);
 	     temp.function_use_information |=temp1.function_use_information;
-	   
-	    if (temp1.function_use_information)
-	   	temp.blk_addresses.push_back(temp1.blk_addr);
+	     temp.blk_addresses.push_back(temp1.blk_addr);
 	    if (mapping_from_cache_block_to_burst_count.find(temp1.blk_addr) ==
 			  mapping_from_cache_block_to_burst_count.end())
 		mapping_from_cache_block_to_burst_count[temp1.blk_addr] = 0;
@@ -2971,11 +3058,13 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_a
     warmup_finished = _warmup_finished;
     //need to change this soon
     total_accesses_made_so_far = future_reference_timestamp;
-    //count accesses only after warmup period.
-    if (warmup_finished) 
+    //count accesses only after warmup period
+    //count only accesses that are not coming from spatial fetches for a function.
+    if (warmup_finished && (!spatial_fetch)) 
    	 _access[accessType][allHit]++;
     
     temp.icache_hit = allHit;
+    temp.spatial_fetch_hit = all_spatial_fetch_hit;
     temp.total_low_use_misses = total_misses_on_low_use_function;
     if (all_non_mru_hit){
 	total_hits_on_non_mru_position++;
@@ -3019,7 +3108,7 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
 						bool degree_of_use, bool medium_degree_of_use,  bool special_cache_type, 
 						uint64_t future_reference_timestamp, bool _warmup_finished,
 						float block_degree_of_use,
-						uint64_t current_function, uint64_t current_function_invocation_count)
+						uint64_t current_function, uint64_t current_function_invocation_count, bool spatial_fetch)
 {
     CACHE_TAG tag;
     UINT32 setIndex;
@@ -3045,11 +3134,13 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
     SET &set = _sets[setIndex];
     bool non_mru_hit = false;
     bool victim_search = false;
-//    if (setIndex == SET_OF_INTEREST)
+    //if (setIndex == SET_OF_INTEREST)
 	victim_search = true;
     
+    bool is_spatial_fetch_block = false;	
     bool hit = set.Find_UpdateDegreeOfUse(addr, tag, degree_of_use, medium_degree_of_use,
-		    non_mru_hit, future_reference_timestamp, victim_search, setIndex);
+		    non_mru_hit, future_reference_timestamp, victim_search, setIndex, is_spatial_fetch_block,
+		    current_function);
  
     if (setIndex == SET_OF_INTEREST){
 
@@ -3065,26 +3156,13 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
 		mapping_from_function_to_current_invocation_count[current_function] = current_function_invocation_count;
 		//add the current function to the map of all other functions in the data structure, to correct tap the reuse distance. 
 
-		for(map<uint64_t,function_invocation_details>::const_iterator iter = mapping_from_function_to_invocation_statistics.begin(); 
-	    			iter != mapping_from_function_to_invocation_statistics.end(); ++iter)
-		{
-			if (iter->first != current_function){
-				mapping_from_function_to_other_functions_accessed_till_next_invocation[iter->first].insert(current_function);	
-	      		}
-		}
 		//update these counts on a miss. 
-		if (!hit){
+		//ignore the misses coming due to spatial fetch of a function
+		if (!hit && (!spatial_fetch)){
 			mapping_from_function_to_invocation_statistics[current_function].intermediate_function_invocations += mapping_from_function_to_other_functions_accessed_till_next_invocation[current_function].size();
 			mapping_from_function_to_invocation_statistics[current_function].total_function_invocations += 1;
 		}
 	
-		if (mapping_from_function_to_invocation_statistics[current_function].total_function_invocations 
-				== 1000){
-			mapping_from_function_to_reuse_distances_over_1000_function_invocations[current_function].push_back((float)mapping_from_function_to_invocation_statistics[current_function].intermediate_function_invocations/mapping_from_function_to_invocation_statistics[current_function].total_function_invocations);
-			mapping_from_function_to_invocation_statistics[current_function].intermediate_function_invocations = 0;
-			mapping_from_function_to_invocation_statistics[current_function].total_function_invocations = 0;
-		}
-		mapping_from_function_to_other_functions_accessed_till_next_invocation[current_function].clear();	
 	}
 	    
     }
@@ -3095,20 +3173,18 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
 	if ((non_mru_hit) || (!hit)){
 	   array_of_nmru_plus_miss_references_per_set[setIndex]++;
 	   
-	if ((setIndex == SET_OF_INTEREST)){
-		if (mapping_from_function_to_functions_evicted_to_make_room[current_function].find(previous_accessed_function) 
-				== mapping_from_function_to_functions_evicted_to_make_room[current_function].end())
-			mapping_from_function_to_functions_evicted_to_make_room[current_function][previous_accessed_function] = 0;
-		else
-			mapping_from_function_to_functions_evicted_to_make_room[current_function][previous_accessed_function]++;
-		previous_accessed_function = current_function;
-	}  
+//	if ((setIndex == SET_OF_INTEREST)){
+//		if (mapping_from_function_to_functions_evicted_to_make_room[current_function].find(previous_accessed_function) 
+//				== mapping_from_function_to_functions_evicted_to_make_room[current_function].end())
+//			mapping_from_function_to_functions_evicted_to_make_room[current_function][previous_accessed_function] = 0;
+//		else
+//			mapping_from_function_to_functions_evicted_to_make_room[current_function][previous_accessed_function]++;
+//		previous_accessed_function = current_function;
+//	}  
 	   
-	   if ((setIndex == SET_OF_INTEREST)){
+	//   if ((setIndex == SET_OF_INTEREST)){
 		uint64_t blk_addr = addr&notLineMask;
 		mapping_from_cache_block_to_corresponding_function[blk_addr].insert(current_function);
-		if (!hit)
-			accesses_to_set_56.push_back(current_function);
 		if (mapping_from_cache_block_to_miss_counts.find(blk_addr) == 
 					   mapping_from_cache_block_to_miss_counts.end()){
 			mapping_from_cache_block_to_miss_counts[blk_addr] = 0;
@@ -3134,23 +3210,24 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
 				mapping_from_function_to_total_access_counts.end()){
 			  mapping_from_function_to_total_access_counts[current_function] = 0;
 		}
-		if (non_mru_hit)
-		    hit_miss_accesses_to_set_56.push_back(true);
-		else
-		    hit_miss_accesses_to_set_56.push_back(false);
-		if (degree_of_use)
-		    degree_of_use_block.push_back(true);
-		else
-		    degree_of_use_block.push_back(false);
-		if (!hit){
+	//	if (non_mru_hit)
+	//	    hit_miss_accesses_to_set_56.push_back(true);
+	//	else
+	//	    hit_miss_accesses_to_set_56.push_back(false);
+	//	if (degree_of_use)
+	//	    degree_of_use_block.push_back(true);
+	//	else
+	//	    degree_of_use_block.push_back(false);
+		//ignore the misses coming due to spatial fetch of a function
+		if (!hit && (!spatial_fetch)){
 		    mapping_from_cache_block_to_miss_counts[blk_addr]++;
 		    mapping_from_function_to_miss_counts[current_function]++;
 	        }
 		mapping_from_cache_block_to_access_nmru_plus_miss_counts[blk_addr]++;
 		mapping_from_function_to_access_nmru_plus_miss_counts[current_function]++;
 		mapping_from_cache_block_to_degree_of_use[blk_addr] = degree_of_use;	
-		block_degree_of_use_block.push_back(block_degree_of_use); 
-	   }
+	//	block_degree_of_use_block.push_back(block_degree_of_use); 
+	   //}
 	   counter_of_references_per_set[setIndex]++;
        }
      }
@@ -3161,20 +3238,11 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
     	mapping_from_cache_block_to_total_access_counts[blk_addr]++;
     	mapping_from_function_to_total_access_counts[current_function]++;
     }
-   // if (setIndex == SET_OF_INTEREST){
-   //     if (!hit){
-   //         cout <<"Miss on function: " << current_function << " and cache block address is: " <<
-   // 	       blk_addr	<< endl;	
-   //     }
-   //     else if (non_mru_hit){
-   //        cout <<"NMRU hit on function: " << current_function << " and cache block address is: " <<
-   // 	      blk_addr << endl;	
-   //     }
-   // }
     current_cache_block_in_use = addr&notLineMask;
     //maintain a distribution of misses across sets.
     //maintain a distribution of misses across sets. 
-    if (!hit){
+    //ignore the misses coming due to spatial fetch of a function
+    if (!hit && (!spatial_fetch)){
 	 counter_of_misses_per_set[setIndex]++;
 	 array_of_misses_per_set[setIndex]++;
     }
@@ -3194,6 +3262,7 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
     hit_and_use_information temp;
     use_and_blk_addr temp1;
     temp.icache_hit = hit;
+    temp.spatial_fetch_hit = is_spatial_fetch_block; 
     //by default return low use
     temp.function_use_information = false;
     temp.icache_nmru_hit = false;
@@ -3202,12 +3271,11 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
     {
 	temp1 = set.Replace_GetDegreeOfUse(tag, degree_of_use,addr&notLineMask, medium_degree_of_use,
 			future_reference_timestamp, block_degree_of_use,direct_mapped_bit, false, current_function,
-			victim_search, setIndex);
+			victim_search, setIndex, spatial_fetch);
 	temp.function_use_information = temp1.function_use_information;
-	//Add the cacheblocks to the vector only for high use functions, because
-	//we are interested in the block addresses only for high use functions. 
-	if (temp1.function_use_information)
-	    temp.blk_addresses.push_back(temp1.blk_addr);
+	
+	temp.blk_addresses.push_back(temp1.blk_addr);
+	
 	if (mapping_from_cache_block_to_burst_count.find(temp1.blk_addr) ==
 			mapping_from_cache_block_to_burst_count.end())
 		mapping_from_cache_block_to_burst_count[temp1.blk_addr] = 0;
@@ -3230,13 +3298,14 @@ hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_s
 	 counter_of_references_per_set[setIndex] = 0;
 	 counter_of_misses_per_set[setIndex] = 0;
 	 counter_of_burst1_blocks_replaced_per_set[setIndex] = 0;
-	 direct_mapped_setting_per_set[setIndex] = false;
+//	 direct_mapped_setting_per_set[setIndex] = false;
 
     }
     warmup_finished = _warmup_finished;
     total_accesses_made_so_far = future_reference_timestamp;
     //count accesses only after warmup period.
-    if (warmup_finished) 
+    //count only accesses that are not coming from spatial fetches for a function.
+    if (warmup_finished && (!spatial_fetch)) 
    	 _access[accessType][hit]++;
     if (non_mru_hit){
 	total_hits_on_non_mru_position++;	

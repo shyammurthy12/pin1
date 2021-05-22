@@ -41,8 +41,10 @@ END_LEGAL */
 #include <cassert>
 #include<string>
 #include <stack>
+#include <bitset>
 
 #include "cache.H"
+
 #include "pin_profile.H"
 
 
@@ -59,6 +61,7 @@ using namespace std;
 //for SPEC versus ARM traces
 //#define SPEC_APPS
 #define NON_SPEC_APPS
+#define CALLEE_OF_INTEREST 2151676992
 
 #define SPATIAL_REUSE_STUDY
 #define DEGREE_OF_USE 2.0
@@ -77,9 +80,26 @@ struct function_details{
 map<uint64_t, function_details> distance_of_all_functions_from_a_particular_function;
 #define ORIGIN_FUNCTION 2151475968
 
-#define FUNCTION_OF_INTEREST 2148199424
+#define FUNCTION_OF_INTEREST 2151655040
 uint64_t warmup_interval = 0; 
 
+struct spatial_locality_vector_and_confidence{
+	bitset<20> spatial_locality_vector;
+	//assign the confidence to 1 upon assignment. 
+	//Saturate at 0 and 4 respectively. Use if greater than equal to 2.
+	uint64_t confidence;
+};
+
+//spatial locality measurements for functions. 
+//measure this for a single function for now. 
+map<uint64_t, bitset<20>> spatial_locality_within_10_cache_blocks_from_function_start;
+
+//assign a function a new spatial locality vector when current confidence. 
+map<uint64_t, spatial_locality_vector_and_confidence> spatial_locality_from_function_start_and_confidence;
+
+map<uint64_t, uint64_t> block_to_corresponding_function;
+map<uint64_t, bool> block_to_is_function_root;
+map<uint64_t, set<uint64_t>> function_to_unique_pages_touched;
 
 //to track when we move from one function to another in the cache set.
 uint64_t current_function_in_set_of_interest = 0;
@@ -88,6 +108,9 @@ uint64_t count_seen_so_far = 0;
 
 uint64_t total_instruction_count = 0;
 /* ===================================================================== */
+
+uint64_t prev_cache_block_seen = 0;
+uint64_t prev_instruction = 0;
 
 //datastructure for the duration that a cache block is present in the cache. 
 //which notes that different double words we have accessed in the cache.
@@ -160,6 +183,9 @@ bool enable_instrumentation = true;
 
 uint64_t count_of_instructions = 0;
 
+uint64_t call_stack_hash = 0;
+
+
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE,    "pintool",
     "o", "icache_32k_fg_http_deg2_lru_position_victim8entry.out", "specify icache file name");
 
@@ -176,7 +202,7 @@ KNOB<UINT32> KnobCacheSize(KNOB_MODE_WRITEONCE, "pintool",
 KNOB<UINT32> KnobLineSize(KNOB_MODE_WRITEONCE, "pintool",
     "b","64", "cache block size in bytes");
 KNOB<UINT32> KnobAssociativity(KNOB_MODE_WRITEONCE, "pintool",
-    "a","10", "cache associativity (1 for direct mapped)");
+    "a","8", "cache associativity (1 for direct mapped)");
 
 KNOB<UINT32> KnobITLBSize(KNOB_MODE_WRITEONCE, "pintool",
     "ci","16", "cache size in kilobytes");
@@ -231,7 +257,7 @@ uint64_t prev_ind_jump_iaddr;
 namespace IL1
 {
     const UINT32 max_sets = 256*KILO; // cacheSize / (lineSize * associativity);
-    const UINT32 max_associativity = 2048; // associativity;
+    const UINT32 max_associativity = 8192; // associativity;
     const CACHE_ALLOC::STORE_ALLOCATION allocation = CACHE_ALLOC::STORE_ALLOCATE;
     
     typedef CACHE_ROUND_ROBIN(max_sets, max_associativity, allocation) CACHE;
@@ -248,26 +274,21 @@ namespace ITLB
     typedef CACHE_MODIFIED_CACHE(max_sets, max_associativity, allocation) CACHE;
 }
 
-//// wrap configuation constants into their own name space to avoid name clashes
-//namespace IL2
-//{
-//    const UINT32 max_sets = 256*KILO; // cacheSize / (lineSize * associativity);
-//    const UINT32 max_associativity = 256; // associativity;
-//    const CACHE_ALLOC::STORE_ALLOCATION allocation = CACHE_ALLOC::STORE_ALLOCATE;
-//    
-//    typedef CACHE_ROUND_ROBIN(max_sets, max_associativity, allocation) CACHE;
-//}
-//
-//// wrap configuation constants into their own name space to avoid name clashes
-//namespace ITLB2
-//{
-//    const UINT32 max_sets = KILO*256; // cacheSize / (lineSize * associativity);
-//    const UINT32 max_associativity = 256; // associativity;
-//    const CACHE_ALLOC::STORE_ALLOCATION allocation = CACHE_ALLOC::STORE_ALLOCATE;
-//
-//    typedef CACHE_MODIFIED_CACHE(max_sets, max_associativity, allocation) CACHE;
-//}
 
+struct function_and_page {
+    uint64_t page, function;
+    page_and_cache_block() {}
+    page_and_cache_block (int _page, int _function) {
+        page = _page;
+        function = _function;
+    }
+    bool operator<(const page_and_function &rhs) const{
+        return make_pair(function,page) < make_pair(rhs.function, rhs.page);
+    }
+    bool operator==(const page_and_function &rhs) const{
+        return make_pair(function,page) == make_pair(function, page);
+    }
+};
 
 struct page_and_cache_block {
     uint64_t x, y;
@@ -358,6 +379,16 @@ map<uint64_t, uint64_t> cache_block_current_function_invocation_count;
 map<uint64_t, uint64_t> cache_block_current_function_callee;
 
 
+
+map<uint64_t, map<uint64_t,uint64_t>> mapping_from_current_function_to_caller_and_count_of_calls;
+map<uint64_t, map<uint64_t,uint64_t>> mapping_from_caller_to_current_function_and_count_of_calls;
+//count the number of times a function was invoked.
+map<uint64_t, uint64_t> mapping_from_callee_to_invocation_count;
+
+map<uint64_t, map<uint64_t, uint64_t>> mapping_from_current_call_stack_hash_to_miss_and_count_of_misses;
+map<uint64_t, uint64_t> mapping_from_call_stack_hash_to_misses;
+
+
 map<uint64_t, set<uint64_t> > unique_function_roots_per_cache_block;
 
 uint64_t current_iteration = 0;
@@ -434,200 +465,31 @@ VOID LoadSingle(ADDRINT addr, UINT32 instId)
 VOID LoadMultiFastSimple(ADDRINT addr, UINT32 size, uint64_t future_reference_timestamp, bool warmup_finished)
 {
 	il1->Access_selective_allocate(addr, size, CACHE_BASE::ACCESS_TYPE_LOAD, true, true, false, false,
-				future_reference_timestamp, warmup_finished, 1.0, current_function_callee_address, function_invocation_count[current_function_callee_address].func_invocation_count);
+				future_reference_timestamp, warmup_finished, 1.0, current_function_callee_address, function_invocation_count[current_function_callee_address].func_invocation_count, false);
 }	
 
 
-VOID LoadMultiFast(ADDRINT addr, UINT32 size, uint64_t future_reference_timestamp, 
+
+
+VOID LoadMultiFast_Spatial(ADDRINT addr, UINT32 size, uint64_t future_reference_timestamp, 
 		bool warmup_finished)
 {
+
        //first step is to identify the function we are executing, sometimes we might jump out to function 
        //to run another function and then get back to executing a function. This necessitates the use of call stack
        //to identify the function we are executing.  
          //initialize the number of cache misses for a new cache block to be 0
        if (call_instr_seen){
-	    call_stack.push(current_function_callee_address);
-	    current_function_callee_address = addr;
-	    function_call_seen_so_far++;
-       }
-       else if(return_instr_seen){
-       //clear the number of cache blocks accessed on this function
-       //invocation. 
-	    if (call_stack.size()!=0){
-		current_function_callee_address = call_stack.top();
-		call_stack.pop();
+	    if (mapping_from_callee_to_invocation_count.find(current_function_callee_address) ==
+	        	    mapping_from_callee_to_invocation_count.end()){
+	           mapping_from_callee_to_invocation_count[current_function_callee_address] = 1;
 	    }
-	}
-	    CACHE_TAG tag;
-            UINT32 setIndex;
-	    SplitAddress(addr, tag, setIndex);
-	//    if (setIndex == SET_OF_INTEREST){
-	// 	if (current_function_in_set_of_interest != current_function_callee_address ){
-	//        if (distance_of_all_functions_from_a_particular_function.find(current_function_callee_address) == 
-	//            	    distance_of_all_functions_from_a_particular_function.end()){
-	//        	distance_of_all_functions_from_a_particular_function[current_function_callee_address].function_noted = true;
-	//            distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts = 0;
-	//            distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_invocations = 0;
-	//        }
-	//        else{
-	//            //un-note all functions so we can start noting again. 
-	//            if (current_function_callee_address == ORIGIN_FUNCTION){
-    	//            	cout <<"Hit Origin" << endl;
-	//            	for(std::map<uint64_t,function_details>::iterator iter = distance_of_all_functions_from_a_particular_function.begin(); 
-	//                iter != distance_of_all_functions_from_a_particular_function.end(); ++iter)
-    	//            	{
-	//            		distance_of_all_functions_from_a_particular_function[iter->first].function_noted = false;
-    	//            	}
-	//            }
-	//            else{
-	//            	if (current_function_callee_address == FUNCTION_OF_INTEREST){
-	//            	    cout <<"Here (9760)" << endl;
-	//            	}
-	//            	for(std::map<uint64_t,function_details>::iterator iter = distance_of_all_functions_from_a_particular_function.begin(); 
-	//                iter != distance_of_all_functions_from_a_particular_function.end(); ++iter)
-    	//            	{
-	//            		if (!distance_of_all_functions_from_a_particular_function[iter->first].function_noted){
-	//				if (current_function_callee_address != FUNCTION_OF_INTEREST)
-	//            				distance_of_all_functions_from_a_particular_function[iter->first].cumulative_distance_counts++;
-	//            		}
-    	//            	}
-	//            	
-	//            	if (!distance_of_all_functions_from_a_particular_function[current_function_callee_address].function_noted){
-	//            		
-	//            	       if (current_function_callee_address == FUNCTION_OF_INTEREST){
-	//			cout << distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts - count_seen_so_far << endl;
-	//			count_seen_so_far = distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts;
-	//		       }
-	//			distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts++;
-	//            		distance_of_all_functions_from_a_particular_function[current_function_callee_address].function_noted = true;
-	//            	}
-	//            }
-	//           }
-	//	}
-	//	current_function_in_set_of_interest = current_function_callee_address;
-	//    }
-
-        if (misses_per_cache_block.find(addr/KnobITLBLineSize.Value()) == misses_per_cache_block.end()){ 
-		misses_per_cache_block[addr/KnobITLBLineSize.Value()] = 0;	
-		burst_one_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))] = 0;
-		burst_two_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))] = 0;
-		function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()] = 0;
-		cache_block_current_function[addr/KnobITLBLineSize.Value()] = 0;
-		cache_block_current_function_invocation_count[addr/KnobITLBLineSize.Value()] = 0;
-	 }
-         if (function_invocation_count.find(current_function_callee_address) == 
-          		function_invocation_count.end()){
-		function_invocation_count[current_function_callee_address].func_invocation_count = 0;
-	 }
-	 if (call_instr_seen)
-		 function_invocation_count[current_function_callee_address].func_invocation_count++;
-	 uint64_t current_function_invocation_count;
-	 current_function_invocation_count = function_invocation_count[current_function_callee_address].func_invocation_count; 
-	 //for every cache block, set a degree of use based on how much use it has seen across 
-	 //invocations of functions.
-	 float block_degree_of_use;
-	 bool block_degree_of_use_bool;
-	 bool medium_block_degree_of_use_bool = false;
-	 uint64_t number_of_cache_block_misses = misses_per_cache_block[addr/KnobITLBLineSize.Value()];
-	 uint64_t number_of_cache_block_function_invocations = function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()];
-	 
-	 uint64_t cache_block_burst_one_count = burst_one_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))];
-	 uint64_t cache_block_burst_two_count = burst_two_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))];
-	 uint64_t total_burst_counts = cache_block_burst_one_count + cache_block_burst_two_count;
-	 //do we have one confident cache burst count
-	 uint64_t confident_cache_burst_count = 0;
-	 
-	 if (((float)(cache_block_burst_one_count)/(total_burst_counts))>=BURST_PREDICTION_CONFIDENCE)
-		 confident_cache_burst_count = 1;
-	 else if (((float)(cache_block_burst_two_count)/(total_burst_counts))>=BURST_PREDICTION_CONFIDENCE)
-		 confident_cache_burst_count = 2;
-	 if (number_of_cache_block_misses == 0)
-		 number_of_cache_block_misses = 1;
-	 
-	 
-	 block_degree_of_use = (float)(number_of_cache_block_function_invocations)/number_of_cache_block_misses;
-	 
-
-	 //wait for some number of misses before classifying a block as a low use cache block. 
-	 //treating blocks with degree of use under 1.0 similar to blocks with degree of use over 1.0
-	 if ((block_degree_of_use>=1.0)&&(block_degree_of_use<=DEGREE_OF_USE)&&(number_of_cache_block_function_invocations>= INVOCATION_THRESHOLD)&&(confident_cache_burst_count)){
-            block_degree_of_use_bool = false;
-	    if ((block_degree_of_use > MEDIUM_DEGREE_OF_USE))
-		    medium_block_degree_of_use_bool = true;
-	 }
-	 else
-	   block_degree_of_use_bool = true;
-	 if (confident_cache_burst_count == 2)
-		block_degree_of_use = 2.0;
-	 else if (confident_cache_burst_count == 1)
-		block_degree_of_use = 1.0;
-	 hit_and_use_information temp1;
-	 //set the degree of use flag to true for code
-       //from functions with a high degree of use. 
-       //because degree of use affects placement in the cache, allow for a few misses before we start to place functions
-       //assuming they are a low use function.  
-       
-	 if ((!block_degree_of_use_bool)){
-		 bool medium_degree_of_use = false;
-		 if (medium_block_degree_of_use_bool)
-			 medium_degree_of_use = true;
-		 temp1 = il1->Access_selective_allocate(addr, size, CACHE_BASE::ACCESS_TYPE_LOAD, true, false, medium_degree_of_use, false,future_reference_timestamp, warmup_finished,
-				 block_degree_of_use, current_function_callee_address,
-				 current_function_invocation_count);
-	 }
-	 else
-       		temp1 = il1->Access_selective_allocate(addr, size,  CACHE_BASE::ACCESS_TYPE_LOAD, true, true, false, false,future_reference_timestamp, warmup_finished,
-				block_degree_of_use, current_function_callee_address,
-				current_function_invocation_count);
- 	 	 
-	if (!temp1.icache_hit){
-	   //count the misses per cache block 
-	   misses_per_cache_block[addr/KnobITLBLineSize.Value()]++;
-	   if (temp1.burst_count_of_missed_block == 1)
-	   	burst_one_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))]++;
-	   else if (temp1.burst_count_of_missed_block == 2)
-	   	burst_two_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))]++;
-
-	}
-	//update cache block statistics based on function invocation
-	 if (cache_block_current_function[addr/KnobITLBLineSize.Value()] != current_function_callee_address){
- 		function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()]++;	 		
-	 }
-	 else if (cache_block_current_function_invocation_count[addr/KnobITLBLineSize.Value()] != 
-			 function_invocation_count[current_function_callee_address].func_invocation_count){
- 		function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()]++;	 		
-	 }
-	 //else, we are on the same function's invocation count and block use stays the same. 
-	
-	 cache_block_current_function[addr/KnobITLBLineSize.Value()] = current_function_callee_address;
-	 cache_block_current_function_invocation_count[addr/KnobITLBLineSize.Value()] = 
-		 function_invocation_count[current_function_callee_address].func_invocation_count;
-       	 call_instr_seen = false;
-         ind_jump_seen = false;
-         return_instr_seen = false;
-         syscall_seen = false;
-         dir_jump_instr_seen = false;
-}
-
-/* ===================================================================== */
-
-VOID LoadSingleFastSimple(ADDRINT addr, uint64_t future_reference_timestamp, bool warmup_finished)
-{
-	il1->AccessSingleLine_selective_allocate(addr, CACHE_BASE::ACCESS_TYPE_LOAD, true, true, false, false, future_reference_timestamp, warmup_finished, 1.0,
-			current_function_callee_address,
-			function_invocation_count[current_function_callee_address].func_invocation_count);
-}
-
-VOID LoadSingleFast(ADDRINT addr, uint64_t future_reference_timestamp, 
-		bool warmup_finished)
-{
-
-       //first step is to identify the function we are executing, sometimes we might jump out to function 
-       //to run another function and then get back to executing a function. This necessitates the use of call stack
-       //to identify the function we are executing.  
-         //initialize the number of cache misses for a new cache block to be 0
-       if (call_instr_seen){
+	    else{
+	         mapping_from_callee_to_invocation_count[current_function_callee_address]++;
+	    }
+	    
 	    call_stack.push(current_function_callee_address);
+	    call_stack_hash ^= current_function_callee_address;
 	    current_function_callee_address = addr;
 	    function_call_seen_so_far++;
 	    
@@ -637,151 +499,281 @@ VOID LoadSingleFast(ADDRINT addr, uint64_t future_reference_timestamp,
        //invocation. 
 	    if (call_stack.size()!=0){
 		current_function_callee_address = call_stack.top();
+		call_stack_hash ^= current_function_callee_address;
 		call_stack.pop();
 	    }
 	}
        
-	    CACHE_TAG tag;
-            UINT32 setIndex;
-	    SplitAddress(addr, tag, setIndex);
-	   // if (setIndex == SET_OF_INTEREST){
-	   //     if (current_function_in_set_of_interest != current_function_callee_address ){
-	   //     if (distance_of_all_functions_from_a_particular_function.find(current_function_callee_address) == 
-	   //         	    distance_of_all_functions_from_a_particular_function.end()){
-	   //     	distance_of_all_functions_from_a_particular_function[current_function_callee_address].function_noted = true;
-	   //         distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts = 0;
-	   //         distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_invocations = 0;
-	   //     }
-	   //     else{
-	   //         //un-note all functions so we can start noting again. 
-	   //         if (current_function_callee_address == ORIGIN_FUNCTION){
-    	   //         	cout <<"Hit Origin" << endl;
-	   //         	for(std::map<uint64_t,function_details>::iterator iter = distance_of_all_functions_from_a_particular_function.begin(); 
-	   //             iter != distance_of_all_functions_from_a_particular_function.end(); ++iter)
-    	   //         	{
-	   //         		distance_of_all_functions_from_a_particular_function[iter->first].function_noted = false;
-    	   //         	}
-	   //         }
-	   //         else{
-	   //         	if (current_function_callee_address == FUNCTION_OF_INTEREST){
-	   //         	    cout <<"Here (9760)" << endl;
-	   //         	}
-	   //         	for(std::map<uint64_t,function_details>::iterator iter = distance_of_all_functions_from_a_particular_function.begin(); 
-	   //             iter != distance_of_all_functions_from_a_particular_function.end(); ++iter)
-    	   //         	{
-	   //         		if (!distance_of_all_functions_from_a_particular_function[iter->first].function_noted){
-	   //     			if (current_function_callee_address != FUNCTION_OF_INTEREST)
-	   //     			distance_of_all_functions_from_a_particular_function[iter->first].cumulative_distance_counts++;
-	   //         		}
-    	   //         	}
-	   //         	
-	   //         	if (!distance_of_all_functions_from_a_particular_function[current_function_callee_address].function_noted){
-	   //         	       if (current_function_callee_address == FUNCTION_OF_INTEREST){
-	   //     		cout << distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts - count_seen_so_far << endl;
-	   //     		count_seen_so_far = distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts;
-	   //     	       }
-	   //     		distance_of_all_functions_from_a_particular_function[current_function_callee_address].cumulative_distance_counts++;
-	   //         		distance_of_all_functions_from_a_particular_function[current_function_callee_address].function_noted = true;
-	   //         	}
-	   //         }
-	   //        }
-	   //     }
-	   //     current_function_in_set_of_interest = current_function_callee_address;
-	   // }
 
-       if (misses_per_cache_block.find(addr/KnobITLBLineSize.Value()) == misses_per_cache_block.end()){ 
-		burst_one_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))] = 0;
-		burst_two_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))] = 0;
-		misses_per_cache_block[addr/KnobITLBLineSize.Value()] = 0;	
-		function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()] = 0;
-		cache_block_current_function[addr/KnobITLBLineSize.Value()] = 0;
-		cache_block_current_function_invocation_count[addr/KnobITLBLineSize.Value()] = 0;
-	 }
-         if (function_invocation_count.find(current_function_callee_address) == 
-          		function_invocation_count.end()){
-		function_invocation_count[current_function_callee_address].func_invocation_count = 0;
-	 }
-	 if (call_instr_seen)
-		 function_invocation_count[current_function_callee_address].func_invocation_count++;
-	 
 	 uint64_t current_function_invocation_count;
 	 current_function_invocation_count = function_invocation_count[current_function_callee_address].func_invocation_count; 
 	 //for every cache block, set a degree of use based on how much use it has seen across 
 	 //invocations of functions.
-	 float block_degree_of_use;
-	 bool block_degree_of_use_bool;
-	 bool medium_block_degree_of_use_bool = false;
-	 uint64_t number_of_cache_block_misses = misses_per_cache_block[addr/KnobITLBLineSize.Value()];
-	 uint64_t number_of_cache_block_function_invocations = function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()];
-	 
-	 uint64_t cache_block_burst_one_count = burst_one_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))];
-	 uint64_t cache_block_burst_two_count = burst_two_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))];
-	 uint64_t total_burst_counts = cache_block_burst_one_count + cache_block_burst_two_count;
-	 //do we have one confident cache burst count
-	 uint64_t confident_cache_burst_count = 0;
-	 if (((float)(cache_block_burst_one_count)/(total_burst_counts))>=BURST_PREDICTION_CONFIDENCE)
-		 confident_cache_burst_count = 1;
-	 else if (((float)(cache_block_burst_two_count)/(total_burst_counts))>=BURST_PREDICTION_CONFIDENCE)
-		 confident_cache_burst_count = 2;
-	 if (number_of_cache_block_misses == 0)
-		 number_of_cache_block_misses = 1;
-	 block_degree_of_use = (float)(number_of_cache_block_function_invocations)/number_of_cache_block_misses;
-	 
-
-	 //wait for some number of misses before classifying a block as a low use cache block. 
-	 //treating blocks with degree of use under 1.0 similar to blocks with degree of use over 1.0
-//want to have a confident cache burst count to assign to a cache block.
-	 if ((block_degree_of_use>=1.0)&&(block_degree_of_use<=DEGREE_OF_USE)&&(number_of_cache_block_function_invocations>= INVOCATION_THRESHOLD) &&(confident_cache_burst_count)){
-	    block_degree_of_use_bool = false;
-	    if ((block_degree_of_use > MEDIUM_DEGREE_OF_USE))
-		    medium_block_degree_of_use_bool = true;
-	 }
-	 else
-	   block_degree_of_use_bool = true;
-	 if (confident_cache_burst_count == 2)
-		block_degree_of_use = 2.0;
-	 else if (confident_cache_burst_count == 1)
-		block_degree_of_use = 1.0;
 	 hit_and_use_information temp1;
 	 //set the degree of use flag to true for code
        //from functions with a high degree of use. 
        //because degree of use affects placement in the cache, allow for a few misses before we start to place functions
        //assuming they are a low use function.  
-       
-	 if ((!block_degree_of_use_bool)){
-		 bool medium_degree_of_use = false;
-		 if (medium_block_degree_of_use_bool)
-			 medium_degree_of_use = true;
-		 temp1 = il1->AccessSingleLine_selective_allocate(addr, CACHE_BASE::ACCESS_TYPE_LOAD, true, false, medium_degree_of_use, false,future_reference_timestamp, warmup_finished,
-				 block_degree_of_use, current_function_callee_address,
-				 current_function_invocation_count);
-	 }
-	 else
-       		temp1 = il1->AccessSingleLine_selective_allocate(addr, CACHE_BASE::ACCESS_TYPE_LOAD, true, true, false, false,future_reference_timestamp, warmup_finished,
-				block_degree_of_use, current_function_callee_address,
-				current_function_invocation_count);
- 	 	 
-	if (!temp1.icache_hit){
-	   //count the misses per cache block 
-	   misses_per_cache_block[addr/KnobITLBLineSize.Value()]++;
-	   if (temp1.burst_count_of_missed_block == 1)
-	   	burst_one_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))]++;
-	   else if (temp1.burst_count_of_missed_block == 2)
-	   	burst_two_counts_per_normal_cache[addr&(~(KnobITLBLineSize.Value()-1))]++;
+	temp1 = il1->Access_selective_allocate(addr, size, CACHE_BASE::ACCESS_TYPE_LOAD, true, true, false, false,
+				future_reference_timestamp, warmup_finished, 1.0, current_function_callee_address, current_function_invocation_count, false);
+	function_to_unique_pages_touched[current_function_callee_address].insert(addr/4096);
+	if ((!temp1.icache_hit)||(temp1.spatial_fetch_hit)){
+		if (call_instr_seen){
+		  // std::stringstream buffer;
+                  // buffer << spatial_locality_from_function_start_and_confidence[current_function_callee_address].spatial_locality_vector <<","<<spatial_locality_from_function_start_and_confidence[current_function_callee_address].confidence <<endl;
+	          // string str =  buffer.str();
+		  // cout << str;
+		   uint64_t root_function_block = (current_function_callee_address/64)*64; 
+		   //issue spatial prefetch only when we have some amount of confidence on the block access pattern. 
+		   if (spatial_locality_from_function_start_and_confidence[current_function_callee_address].confidence >= 2){
+			for (size_t i=1; i<spatial_locality_from_function_start_and_confidence[current_function_callee_address].spatial_locality_vector.size();
+		     		 ++i){
+		         //issue a spatial fetch for the corresponding cache blocks. 
+    		         
+			if (spatial_locality_from_function_start_and_confidence[current_function_callee_address].spatial_locality_vector.test(i)){
+		               bool spatial_fetch = true;
+       		       	       uint64_t blk_addr_to_fetch = root_function_block + i*64;
+       				il1->AccessSingleLine_selective_allocate(blk_addr_to_fetch, CACHE_BASE::ACCESS_TYPE_LOAD, 
+					true, true, false, false,future_reference_timestamp, warmup_finished,
+					1.0, current_function_callee_address,
+					current_function_invocation_count, spatial_fetch);
+		         }
+		      }
+		   }
+		    
+		   spatial_locality_within_10_cache_blocks_from_function_start[current_function_callee_address].reset();
+		   spatial_locality_within_10_cache_blocks_from_function_start[current_function_callee_address].set(0);
+		   block_to_is_function_root[addr/64] = true;
+                   block_to_corresponding_function[addr/64] = current_function_callee_address; 
+               }
+               else {
+		    // if (!temp1.icache_hit){
+                    //    int64_t distance_from_root_of_function_cache_block = addr/64 - current_function_callee_address/64;
+		    //    cout << "Miss and distance (single) from root is " <<distance_from_root_of_function_cache_block << " (calls seen so far)" << function_call_seen_so_far << endl;
+		    // }
+		    // if (temp1.spatial_fetch_hit && (current_function_callee_address == CALLEE_OF_INTEREST)){
+                    //    int64_t distance_from_root_of_function_cache_block = addr/64 - current_function_callee_address/64;
+		    //    cout << "Spatial hit and distance (single) from root is " <<distance_from_root_of_function_cache_block << " (calls seen so far)" << function_call_seen_so_far << endl;
+		    // }
+                    //  if (current_function_callee_address == CALLEE_OF_INTEREST){
+		    //  	cout << "Block address is: " << addr/64 << endl;
+		    //  }
+		      uint64_t distance_from_root_of_function_cache_block = addr/64 - current_function_callee_address/64;
+                      if (distance_from_root_of_function_cache_block < 20)
+                    	   spatial_locality_within_10_cache_blocks_from_function_start[current_function_callee_address].set(distance_from_root_of_function_cache_block);
+		      //don't want to reset this bit for the block if it is already a 
+		      //root of some other function to start with. 
+                      block_to_is_function_root[addr/64] = false;
+               }
 	}
-	//update cache block statistics based on function invocation
-	 if (cache_block_current_function[addr/KnobITLBLineSize.Value()] != current_function_callee_address){
- 		function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()]++;	 		
-	 }
-	 else if (cache_block_current_function_invocation_count[addr/KnobITLBLineSize.Value()] != 
-			 function_invocation_count[current_function_callee_address].func_invocation_count){
- 		function_invocations_per_cache_block[addr/KnobITLBLineSize.Value()]++;	 		
-	 }
-	 //else, we are on the same function's invocation count and block use stays the same. 
-	
-	 cache_block_current_function[addr/KnobITLBLineSize.Value()] = current_function_callee_address;
-	 cache_block_current_function_invocation_count[addr/KnobITLBLineSize.Value()] = 
-		 function_invocation_count[current_function_callee_address].func_invocation_count;
+	if (!temp1.icache_hit){
+	   //when the root of the function is evicted, stop recording the 
+	   //spatial locality vector.
+	   for(std::vector<uint64_t>::iterator it = temp1.blk_addresses.begin(); it != temp1.blk_addresses.end(); ++it) {
+	        uint64_t blk_addr = (*it)/64;
+		//if it is the root of a function
+		if (block_to_is_function_root[blk_addr]){
+		   //find the corresponding callee address and reset the bitvector. 
+		   uint64_t callee_address = block_to_corresponding_function[blk_addr];
+		   if (callee_address == CALLEE_OF_INTEREST)
+			   cout << "Evicting callee of interest " << endl;
+		   //learning spatial bit vector when the root of the function is evicted from the instruction cache. 
+		   if (spatial_locality_from_function_start_and_confidence.find(callee_address) == 
+				  spatial_locality_from_function_start_and_confidence.end()){
+			  spatial_locality_from_function_start_and_confidence[callee_address].spatial_locality_vector =  
+				  spatial_locality_within_10_cache_blocks_from_function_start[callee_address];
+		   	  spatial_locality_from_function_start_and_confidence[callee_address].confidence = 
+				  2;
+		   }
+		   else{
+		        if (spatial_locality_from_function_start_and_confidence[callee_address].spatial_locality_vector == 
+		        		spatial_locality_within_10_cache_blocks_from_function_start[callee_address]){
+		        	spatial_locality_from_function_start_and_confidence[callee_address].confidence = min(
+		        		(int)(spatial_locality_from_function_start_and_confidence[callee_address].confidence+1),4);
+		        	cout << "Matches earlier " << endl;
+		        }
+		        else{
+		        	cout << "Does not match earlier " << endl;
+		        	if (spatial_locality_from_function_start_and_confidence[callee_address].confidence == 0){
+		        	   spatial_locality_from_function_start_and_confidence[callee_address].spatial_locality_vector =
+		        	   	spatial_locality_within_10_cache_blocks_from_function_start[callee_address];
+		        	   spatial_locality_from_function_start_and_confidence[callee_address].confidence = 1;	   
+		        	}
+		        	else{
+		        	   spatial_locality_from_function_start_and_confidence[callee_address].confidence--;	   
+		        	}
+		        		
+		        }
+
+		   }
+		}
+	   }
+	   //count the misses per cache block 
+	}
+       	 call_instr_seen = false;
+         ind_jump_seen = false;
+         return_instr_seen = false;
+         syscall_seen = false;
+         dir_jump_instr_seen = false;
+}
+
+
+/* ===================================================================== */
+VOID LoadSingleFastSimple(ADDRINT addr, uint64_t future_reference_timestamp, bool warmup_finished)
+{
+	il1->AccessSingleLine_selective_allocate(addr, CACHE_BASE::ACCESS_TYPE_LOAD, true, true, false, false, future_reference_timestamp, warmup_finished, 1.0,
+			current_function_callee_address,
+			function_invocation_count[current_function_callee_address].func_invocation_count, false);
+}
+
+VOID LoadSingleFast_Spatial(ADDRINT addr, uint64_t future_reference_timestamp, 
+		bool warmup_finished)
+{
+
+       //first step is to identify the function we are executing, sometimes we might jump out to function 
+       //to run another function and then get back to executing a function. This necessitates the use of call stack
+       //to identify the function we are executing.  
+         //initialize the number of cache misses for a new cache block to be 0
+       if (call_instr_seen){
+	    if (mapping_from_callee_to_invocation_count.find(current_function_callee_address) ==
+	        	    mapping_from_callee_to_invocation_count.end()){
+	           mapping_from_callee_to_invocation_count[current_function_callee_address] = 1;
+	    }
+	    else{
+	         mapping_from_callee_to_invocation_count[current_function_callee_address]++;
+	    }
+	    
+	    call_stack.push(current_function_callee_address);
+	    call_stack_hash ^= current_function_callee_address;
+	    current_function_callee_address = addr;
+	    function_call_seen_so_far++;
+	    
+       }
+       else if(return_instr_seen){
+       //clear the number of cache blocks accessed on this function
+       //invocation. 
+	    if (call_stack.size()!=0){
+		current_function_callee_address = call_stack.top();
+		call_stack_hash ^= current_function_callee_address;
+		call_stack.pop();
+	    }
+	}
+       
+
+	 uint64_t current_function_invocation_count;
+	 current_function_invocation_count = function_invocation_count[current_function_callee_address].func_invocation_count; 
+	 //for every cache block, set a degree of use based on how much use it has seen across 
+	 //invocations of functions.
+	 hit_and_use_information temp1;
+	 //set the degree of use flag to true for code
+       //from functions with a high degree of use. 
+       //because degree of use affects placement in the cache, allow for a few misses before we start to place functions
+       //assuming they are a low use function.  
+	temp1 = il1->AccessSingleLine_selective_allocate(addr, CACHE_BASE::ACCESS_TYPE_LOAD, true, false, false, false,future_reference_timestamp, warmup_finished,
+	       	 1.0, current_function_callee_address,
+	       	 current_function_invocation_count, false);
+	function_to_unique_pages_touched[current_function_callee_address].insert(addr/4096);
+	if ((!temp1.icache_hit)||(temp1.spatial_fetch_hit)){
+		if (current_function_callee_address == CALLEE_OF_INTEREST){
+		if (call_instr_seen){
+		   cout <<"Unique pages touched by function " << function_to_unique_pages_touched[current_function_callee_address].size() << endl;
+		   std::stringstream buffer;
+                   buffer << spatial_locality_from_function_start_and_confidence[current_function_callee_address].spatial_locality_vector <<","<<spatial_locality_from_function_start_and_confidence[current_function_callee_address].confidence <<endl;
+	           string str =  buffer.str();
+		   cout << str;
+		   uint64_t root_function_block = (current_function_callee_address/64)*64; 
+		   //issue spatial prefetch only when we have some amount of confidence on the block access pattern. 
+		   if (spatial_locality_from_function_start_and_confidence[current_function_callee_address].confidence >= 2){
+			for (size_t i=1; i<spatial_locality_from_function_start_and_confidence[current_function_callee_address].spatial_locality_vector.size();
+		     		 ++i){
+		         //issue a spatial fetch for the corresponding cache blocks. 
+    		         
+			if (spatial_locality_from_function_start_and_confidence[current_function_callee_address].spatial_locality_vector.test(i)){
+		               bool spatial_fetch = true;
+       		       	       uint64_t blk_addr_to_fetch = root_function_block + i*64;
+       				il1->AccessSingleLine_selective_allocate(blk_addr_to_fetch, CACHE_BASE::ACCESS_TYPE_LOAD, 
+					true, true, false, false,future_reference_timestamp, warmup_finished,
+					1.0, current_function_callee_address,
+					current_function_invocation_count, spatial_fetch);
+		              // cout << "Block number: " << i << endl;
+		         }
+		      }
+		   }
+		   
+		   spatial_locality_within_10_cache_blocks_from_function_start[current_function_callee_address].reset();
+		   spatial_locality_within_10_cache_blocks_from_function_start[current_function_callee_address].set(0);
+		   block_to_is_function_root[addr/64] = true;
+                   block_to_corresponding_function[addr/64] = current_function_callee_address; 
+               }
+               else {
+		     if (!temp1.icache_hit){
+                        int64_t distance_from_root_of_function_cache_block = addr/64 - current_function_callee_address/64;
+		        cout << "Miss and distance (single) from root is " <<distance_from_root_of_function_cache_block << " (calls seen so far)" << function_call_seen_so_far << endl;
+		     }
+		     if (temp1.spatial_fetch_hit && (current_function_callee_address == CALLEE_OF_INTEREST)){
+                        int64_t distance_from_root_of_function_cache_block = addr/64 - current_function_callee_address/64;
+		        cout << "Spatial hit and distance (single) from root is " <<distance_from_root_of_function_cache_block << " (calls seen so far)" << function_call_seen_so_far << endl;
+		     }
+                     // if (current_function_callee_address == CALLEE_OF_INTEREST){
+		     // 	cout << "Block address is: " << addr/64 << endl;
+		     // }
+		      uint64_t distance_from_root_of_function_cache_block = addr/64 - current_function_callee_address/64;
+                      if (distance_from_root_of_function_cache_block < 20)
+                    	   spatial_locality_within_10_cache_blocks_from_function_start[current_function_callee_address].set(distance_from_root_of_function_cache_block);
+		      //don't want to reset this bit for the block if it is already a 
+		      //root of some other function to start with. 
+                      block_to_is_function_root[addr/64] = false;
+               }
+	    }
+	}
+	if (!temp1.icache_hit){
+	   //when the root of the function is evicted, stop recording the 
+	   //spatial locality vector.
+	   for(std::vector<uint64_t>::iterator it = temp1.blk_addresses.begin(); it != temp1.blk_addresses.end(); ++it) {
+	        uint64_t blk_addr = (*it)/64;
+		//if it is the root of a function
+		if (block_to_is_function_root[blk_addr]){
+		   //find the corresponding callee address and reset the bitvector. 
+		   uint64_t callee_address = block_to_corresponding_function[blk_addr];
+		   if (callee_address == CALLEE_OF_INTEREST)
+			   cout << "Evicting callee of interest " << endl;
+		   else
+			   cout << "Evicting " << callee_address << endl;
+		   //learning spatial bit vector when the root of the function is evicted from the instruction cache. 
+		   if (callee_address == CALLEE_OF_INTEREST){
+		   if (spatial_locality_from_function_start_and_confidence.find(callee_address) == 
+				  spatial_locality_from_function_start_and_confidence.end()){
+			  spatial_locality_from_function_start_and_confidence[callee_address].spatial_locality_vector =  
+				  spatial_locality_within_10_cache_blocks_from_function_start[callee_address];
+		   	  spatial_locality_from_function_start_and_confidence[callee_address].confidence = 
+				  2;
+		   }
+		   else{
+		        if (spatial_locality_from_function_start_and_confidence[callee_address].spatial_locality_vector == 
+		        		spatial_locality_within_10_cache_blocks_from_function_start[callee_address]){
+		        	spatial_locality_from_function_start_and_confidence[callee_address].confidence = min(
+		        		(int)(spatial_locality_from_function_start_and_confidence[callee_address].confidence+1),4);
+		        	cout << "Matches earlier " << endl;
+		        }
+		        else{
+		        	cout << "Does not match earlier " << endl;
+		        	if (spatial_locality_from_function_start_and_confidence[callee_address].confidence == 0){
+		        	   spatial_locality_from_function_start_and_confidence[callee_address].spatial_locality_vector =
+		        	   	spatial_locality_within_10_cache_blocks_from_function_start[callee_address];
+		        	   spatial_locality_from_function_start_and_confidence[callee_address].confidence = 1;	   
+		        	}
+		        	else{
+		        	   spatial_locality_from_function_start_and_confidence[callee_address].confidence--;	   
+		        	}
+		        		
+		        }
+
+		   }
+		   }
+		}
+	   }
+	   //count the misses per cache block 
+	}
        	 call_instr_seen = false;
          ind_jump_seen = false;
          return_instr_seen = false;
@@ -807,13 +799,27 @@ VOID Fini() {
          out << il1->StatsLong("# ", CACHE_BASE::CACHE_TYPE_ICACHE);
          out << "Total instructions in program is " <<  total_instruction_count << endl;
 	 cout << "Function calls seen so far " << function_call_seen_so_far << endl;
-
-    for(std::map<uint64_t,function_details>::iterator iter = distance_of_all_functions_from_a_particular_function.begin(); 
-		    iter != distance_of_all_functions_from_a_particular_function.end(); ++iter)
+    out << "For every function, printing number of unique functions called and the count of calls made to that function by this function " << endl;
+	
+    for(std::map<uint64_t,uint64_t>::iterator iter = mapping_from_callee_to_invocation_count.begin(); 
+		    iter != mapping_from_callee_to_invocation_count.end(); ++iter)
     {
-	out <<"Origin is : " << ORIGIN_FUNCTION << endl; 
-	out << "Function is " << iter->first <<": and distance from origin is " <<(float)distance_of_all_functions_from_a_particular_function[iter->first].cumulative_distance_counts/distance_of_all_functions_from_a_particular_function[iter->first].cumulative_invocations << endl;
+	out <<"The caller address is : " << iter->first << endl;
+	out <<"Number of function invocations is : " << iter->second  << endl; 
     }
+   // for(std::map<uint64_t,map<uint64_t,uint64_t>>::iterator iter =  mapping_from_caller_to_current_function_and_count_of_calls.begin(); 
+   //     	    iter != mapping_from_caller_to_current_function_and_count_of_calls.end(); ++iter)
+   // {
+   //     out <<"The caller address is : " << iter->first << endl;
+   //     out <<"Unique callees are : " << iter->second.size()  << endl; 
+   //    // out <<"Total misses are : " << mapping_from_call_stack_hash_to_misses[iter->first]  << endl; 
+   //     out <<"{";
+   //     for(std::map<uint64_t,uint64_t>::iterator iter1 = iter->second.begin(); 
+   //     	    iter1 != iter->second.end(); ++iter1)
+   //     	out << "(" << iter1->first << "," << iter1->second <<"),";
+   // 	out << "}" << endl;
+   //     out  << endl;
+   // }
 }
 
 
@@ -828,12 +834,17 @@ VOID Instruction(ADDRINT iaddr, uint32_t size, uint32_t control_flow_type, uint6
     const BOOL   single = (size <= 4);
                 
     if (single)
-	LoadSingleFast(iaddr, future_reference_timestamp, warmup_finished);
+	LoadSingleFast_Spatial(iaddr, future_reference_timestamp, warmup_finished);
     else
-	LoadMultiFast(iaddr,size,future_reference_timestamp, warmup_finished);
+	LoadMultiFast_Spatial(iaddr,size,future_reference_timestamp, warmup_finished);
     //returns
     if (control_flow_type == 6){
-         return_instr_seen = true; 
+         return_instr_seen = true;
+	 if (current_function_callee_address == CALLEE_OF_INTEREST){
+		 cout << "Return Address :"<< iaddr/64 << endl;
+		 cout << "Caller Address :" << current_function_callee_address/64 << endl;
+		cout <<"The size of the function is " << (iaddr-current_function_callee_address)/64 << endl; 
+	 }
     }
     //direct calls
     else if (control_flow_type == 2 ){
@@ -851,6 +862,9 @@ VOID Instruction(ADDRINT iaddr, uint32_t size, uint32_t control_flow_type, uint6
     //indirect jumps
     else if (control_flow_type == 5){
          ind_jump_seen = true;
+//	 if (current_function_callee_address == CALLEE_OF_INTEREST){
+//	 	cout <<"Indirect Jump seen" << endl;
+//	 }
          prev_ind_jump_page = iaddr/4096;
     }
     //system calls
